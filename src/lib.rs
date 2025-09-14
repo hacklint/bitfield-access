@@ -2,8 +2,7 @@
 #![no_std]
 
 use core::{
-    fmt::{Debug, UpperHex},
-    ops::{Bound, RangeBounds},
+    cmp::min, fmt::{Debug, UpperHex}, ops::{Bound, RangeBounds}
 };
 
 use num_traits::{CheckedShr, PrimInt, Unsigned};
@@ -18,6 +17,21 @@ fn bitmask<T: PrimInt + Unsigned>(bit_width: usize) -> T {
         T::from((1_usize << bit_width) - 1).unwrap()
     }
 }
+
+// The "rng" helper here is renamed but based on Rust lang forum by "cuviper":
+// https://internals.rust-lang.org/t/the-need-for-decreasing-range-syntax-5-0/15742/7
+fn rng(a:usize, b: usize) -> impl Iterator<Item=usize> {
+    // Helper for creating range-like iterators counting either up _or_ down without type issues
+    let (part1, part2) = if a <= b {
+        (a..=b, 1..=0)
+    } else {
+        (1..=0, b..=a)
+    };
+    part1.chain(part2.rev())
+}
+
+impl<T> BitfieldAccess for T where T: AsRef<[u8]> {}
+
 
 pub trait BitfieldAccess: AsRef<[u8]> {
     /// Read a bitfield with the given bit indices from a buffer.
@@ -38,7 +52,7 @@ pub trait BitfieldAccess: AsRef<[u8]> {
     /// Panics if the range of bits is wider than the integer type `T`
     /// or the bit indices are out of bounds.
     #[inline]
-    fn read_field<T>(&self, bitrange: impl RangeBounds<usize>) -> T
+    fn _read_field<T>(&self, bitrange: impl RangeBounds<usize>, is_msb0: bool) -> T
     where
         T: PrimInt + Unsigned,
     {
@@ -67,18 +81,45 @@ pub trait BitfieldAccess: AsRef<[u8]> {
         );
         let first_byte = start / 8;
         let last_byte = (end - 1) / 8;
-        let num_bytes = last_byte - first_byte + 1;
-        let offset = 7 - (end - 1) % 8;
+        let offset = match is_msb0 {
+            true => 7 - (end - 1) % 8,
+            false => start % 8,
+        };
         let mask = bitmask(bit_width);
 
-        // build the result from the last byte (LSB) to the first
-        let mut result = T::from(data[last_byte] >> offset).unwrap();
-        for i in 1..num_bytes {
-            result = result | T::from(data[last_byte - i]).unwrap() << (8 * i - offset);
-        }
+        // Build the result depending on bit numbering
+        let mut byte_orderer = match is_msb0 {
+            true => rng(last_byte, first_byte),
+            false => rng(first_byte, last_byte),
+        };
 
-        result & mask
+        let i = byte_orderer.next().unwrap();
+        let mut result =  match is_msb0 {
+            true => T::from(data[i]).unwrap() >> offset,  // First possibly partial byte, shifted down to LSBit
+            false => (T::from(data[i]).unwrap() >> offset) & bitmask(min(bit_width, 8-offset)), // Shift and mask
+        };
+        for (n, i ) in byte_orderer.enumerate() {
+            result = result | T::from(data[i]).unwrap() << (8 * (n+1) - offset);  // Following bytes, shifted "just in front" of res
+        }
+        result & mask  // Finally clipping to just the wanted bits
     }
+
+    #[inline]
+    fn read_field<T>(&self, bitrange: impl RangeBounds<usize>) -> T
+    where
+        T: PrimInt + Unsigned,
+    {
+        return self._read_field(bitrange, true);
+    }
+
+    #[inline]
+    fn read_field_lsb0<T>(&self, bitrange: impl RangeBounds<usize>) -> T
+    where
+        T: PrimInt + Unsigned,
+    {
+        return self._read_field(bitrange, false);
+    }
+
 
     /// Write a bitfield with the given bit indices to a buffer.
     ///
@@ -97,8 +138,10 @@ pub trait BitfieldAccess: AsRef<[u8]> {
     /// # Panics
     ///
     /// Panics if the bit indices are out of bounds or the value is too large.
+
+
     #[inline]
-    fn write_field<T>(&mut self, bitrange: impl RangeBounds<usize>, mut value: T)
+    fn _write_field<T>(&mut self, bitrange: impl RangeBounds<usize>, mut value: T, is_msb0: bool)
     where
         Self: AsMut<[u8]>,
         T: PrimInt + Unsigned + TryInto<u8> + UpperHex + CheckedShr,
@@ -108,7 +151,7 @@ pub trait BitfieldAccess: AsRef<[u8]> {
         // typically known at compile time, reducing this to just a small handful
         // of shifts and bitwise instructions.
         let data = self.as_mut();
-        let start = match bitrange.start_bound() {
+        let mut start = match bitrange.start_bound() {
             Bound::Included(idx) => *idx,
             Bound::Excluded(idx) => *idx + 1,
             Bound::Unbounded => 0,
@@ -132,19 +175,53 @@ pub trait BitfieldAccess: AsRef<[u8]> {
         let zero = T::from(0x0).unwrap();
 
         // write in one-byte chunks, from the last (LSB) to the first
-        for i in (first_byte..=last_byte).rev() {
-            let bit_offset = 7 - (end - 1) % 8;
+        let byte_orderer = match is_msb0 {
+            true => rng(last_byte, first_byte),
+            false => rng(first_byte, last_byte),
+        };
+
+        for i in byte_orderer {
+            let bit_offset = match is_msb0 {
+                true => 7 - (end - 1) % 8,
+                false => start % 8,
+            };
             let bit_width = core::cmp::min(8 - bit_offset, end - start);
             let bit_mask = bitmask::<u8>(bit_width) << bit_offset;
             let new_bits: u8 = (value & byte_mask).try_into().unwrap();
             data[i] = (data[i] & !bit_mask) | ((new_bits << bit_offset) & bit_mask);
-            end -= bit_width;
+            match is_msb0 {
+                true => {
+                    end -= bit_width;
+                },
+                false => {
+                    start += bit_width;
+                },
+            }
             value = value.checked_shr(bit_width as u32).unwrap_or(zero);
         }
     }
-}
 
-impl<T> BitfieldAccess for T where T: AsRef<[u8]> {}
+    #[inline]
+    fn write_field<T>(&mut self, bitrange: impl RangeBounds<usize>, value: T)
+    where
+        Self: AsMut<[u8]>,
+        T: PrimInt + Unsigned + TryInto<u8> + UpperHex + CheckedShr,
+        <T as TryInto<u8>>::Error: Debug,
+    {
+        return self._write_field(bitrange, value, true);
+    }
+
+
+    #[inline]
+    fn write_field_lsb0<T>(&mut self, bitrange: impl RangeBounds<usize>, value: T)
+    where
+        Self: AsMut<[u8]>,
+        T: PrimInt + Unsigned + TryInto<u8> + UpperHex + CheckedShr,
+        <T as TryInto<u8>>::Error: Debug,
+    {
+        return self._write_field(bitrange, value, false);
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -152,18 +229,40 @@ mod tests {
 
     #[test]
     #[inline(never)]
+    fn test_rng_helper() {
+        assert_eq!(rng(1, 2).next(), Some(1));  // Counting up
+        assert_eq!(rng(2, 1).next(), Some(2));  // Counting down
+    }
+
+    #[test]
+    #[inline(never)]
     fn test_read_field() {
+        let single_byte = [0b10101111u8];
         let buffer = [0x12, 0x34, 0x56, 0x78];
+        let acc = [55u8, 124, 248, 210, 0x7c, 0x18, 0xf8]; // From the field, bits 36..52 = 0x8187
+
+        // Test difference in LSB0 and MSB0 bit ordering
+        assert_eq!(single_byte.read_field::<u8>(0..4), 0b1010u8);
+        assert_eq!(single_byte.read_field_lsb0::<u8>(0..4), 0b1111u8);
+        assert_eq!(single_byte.read_field_lsb0::<u8>(1..=5), 0b10111);  // Get cross-nibble bits
+        assert_eq!(single_byte.read_field::<u8>(3..=5), 0b011);   // Same bits, different adressing
 
         // Test reading a single byte
         assert_eq!(buffer.read_field::<u8>(4..8), 0x2);
         assert_eq!(buffer.read_field::<u8>(8..16), 0x34);
 
+        // From the field
+        assert_eq!(acc.read_field_lsb0::<u16>(36..52), 0x8187);
+
         // Test reading across byte boundaries
         assert_eq!(buffer.read_field::<u16>(4..20), 0x2345);
+        assert_eq!(buffer.read_field_lsb0::<u16>(4..20), 0x6341);
+        assert_eq!(buffer.read_field_lsb0::<u8>(20..28), 0x85);
+        assert_eq!(buffer.read_field_lsb0::<u8>(6..=10), 0b10000u8);
 
         // Test reading the entire buffer
         assert_eq!(buffer.read_field::<u32>(..), 0x12345678);
+        assert_eq!(buffer.read_field_lsb0::<u32>(..), 0x78563412);
 
         // Test reading a single bit
         assert_eq!(buffer.read_field::<u8>(7..8), 0x0);
@@ -174,17 +273,32 @@ mod tests {
     fn test_write_field() {
         const BUFFER: [u8; 4] = [0x12, 0x34, 0x56, 0x78];
 
+        // Test writing to a single-byte buffer
+        let mut buffer = [0];
+        buffer.write_field::<u8>(1..=3, 0x3);
+        assert_eq!(buffer, [0b00110000u8]);
+        buffer[0] = 0;  // Clear to all-zeroes
+        buffer.write_field_lsb0::<u8>(1..=3, 0x3);  // Same value and "symbolic" address, different result
+        assert_eq!(buffer, [0b00000110u8]);
+
         // Test writing a single byte
         let mut buffer = BUFFER;
         buffer.write_field::<u8>(4..8, 0xA);
         assert_eq!(buffer, [0x1A, 0x34, 0x56, 0x78]);
         buffer.write_field::<u8>(0..8, 0xBC);
         assert_eq!(buffer, [0xBC, 0x34, 0x56, 0x78]);
+        buffer.write_field::<u8>(28..32, 0x2);
+        assert_eq!(buffer, [0xBC, 0x34, 0x56, 0x72]);
+        buffer.write_field::<u8>(28..32, 0x8);  // Restore...
+        assert_eq!(buffer, [0xBC, 0x34, 0x56, 0x78]);
 
         // Test writing across byte boundaries
         let mut buffer = BUFFER;
         buffer.write_field::<u8>(12..20, 0xBC);
         assert_eq!(buffer, [0x12, 0x3B, 0xC6, 0x78]);
+        //let mut buffer = [0u8; 4];
+        buffer.write_field_lsb0::<u8>(20..28, 0xDE);
+        assert_eq!(buffer, [0x12, 0x3B, 0xE6, 0x7D]);
 
         // Test writing the entire buffer
         let mut buffer = BUFFER;
